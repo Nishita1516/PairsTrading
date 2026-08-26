@@ -17,6 +17,7 @@ def backtest_pair(
     signals: pd.DataFrame,
     transaction_cost_bps: float = 5.0,
     capital: float = 100_000.0,
+    direction: str = "y_on_x",
 ):
     """
     Simulate P&L for a single pair given a position series.
@@ -28,6 +29,15 @@ def backtest_pair(
     signals : DataFrame from signals.generate_signals (has 'position', 'signal_change')
     transaction_cost_bps : round-trip cost in basis points, applied on signal changes
     capital : notional capital allocated to the pair
+    direction : "y_on_x" (default) or "x_on_y" — matches cointegration.py's
+        bidirectional Engle-Granger result. Determines which leg's return
+        is treated as the dependent leg when computing the spread return:
+            y_on_x -> (y_ret - hedge_ratio * x_ret) / gross_exposure
+            x_on_y -> (x_ret - hedge_ratio * y_ret) / gross_exposure
+        Getting this wrong doesn't crash — it silently computes P&L for
+        the wrong economic position. Every pair result from
+        cointegration.py carries a `direction` field; thread it through
+        here (see backtest_multiple_pairs below for the call pattern).
 
     Returns
     -------
@@ -44,7 +54,12 @@ def backtest_pair(
     # Normalize pair returns by gross exposure so hedge ratios do not inflate
     # reported performance.
     gross_exposure = 1.0 + abs(hedge_ratio)
-    spread_return = (y_ret - hedge_ratio * x_ret) / gross_exposure
+    if direction == "y_on_x":
+        spread_return = (y_ret - hedge_ratio * x_ret) / gross_exposure
+    elif direction == "x_on_y":
+        spread_return = (x_ret - hedge_ratio * y_ret) / gross_exposure
+    else:
+        raise ValueError(f"Unknown direction: {direction!r} (expected 'y_on_x' or 'x_on_y')")
 
     position = signals["position"].shift(1).fillna(0)  # trade on next bar
     strategy_return = position * spread_return
@@ -120,7 +135,9 @@ def backtest_multiple_pairs(
     results (as returned by cointegration.find_all_cointegrated_pairs),
     using default signal parameters. Returns a summary DataFrame.
 
-    pair_results: list of dicts with keys 'pair', 'hedge_ratio', 'intercept'
+    pair_results: list of dicts with keys 'pair', 'hedge_ratio',
+    'intercept', and 'direction' (added by cointegration.py's
+    bidirectional test — defaults to "y_on_x" if a result predates it).
     """
     from src.signals import compute_spread, compute_zscore, generate_signals
 
@@ -130,10 +147,11 @@ def backtest_multiple_pairs(
         if t1 not in prices.columns or t2 not in prices.columns:
             continue
         y, x = prices[t1], prices[t2]
-        spread = compute_spread(y, x, res["hedge_ratio"], res.get("intercept", 0.0))
+        direction = res.get("direction", "y_on_x")
+        spread = compute_spread(y, x, res["hedge_ratio"], res.get("intercept", 0.0), direction=direction)
         z = compute_zscore(spread, window=zscore_window)
         sig = generate_signals(z, entry_threshold, exit_threshold, stop_loss)
-        _, metrics = backtest_pair(y, x, res["hedge_ratio"], sig, **kwargs)
+        _, metrics = backtest_pair(y, x, res["hedge_ratio"], sig, direction=direction, **kwargs)
         metrics["pair"] = f"{t1}-{t2}"
         summaries.append(metrics)
 

@@ -7,21 +7,25 @@ Run with:
     streamlit run app.py
 """
 
+import os
+
 import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from src.downloader import download_universe, NIFTY50_TICKERS
+from src.downloader import download_universe, BFSI_TICKERS
 from src.preprocessing import build_feature_matrix
 from src.clustering import run_pca, run_dbscan, get_cluster_groups, suggest_eps
 from src.cointegration import find_all_cointegrated_pairs
 from src.signals import compute_spread, compute_zscore, generate_signals
 from src.backtest import backtest_pair, backtest_multiple_pairs
+from src.meta_labeling import load_model
+from src.meta_backtest import apply_meta_filter_to_signals, backtest_multiple_pairs_with_meta_filter
 
 
 st.set_page_config(page_title="Pairs Trading Dashboard", layout="wide")
 st.title("Statistical Arbitrage: PCA + DBSCAN Pairs Trading")
-st.caption("NIFTY 50 universe | PCA clustering | Engle-Granger cointegration | Z-score signals | Backtest")
+st.caption("BFSI (Banking & NBFC) universe | PCA clustering | Engle-Granger cointegration | Benjamini-Hochberg corrected | Z-score signals | Backtest")
 
 with st.sidebar:
     st.header("Configuration")
@@ -50,19 +54,42 @@ with st.sidebar:
         help="Delete cached CSV and re-download from yfinance",
     )
 
+    st.subheader("Meta-Model Filter")
+    MODEL_PATH = "models/meta_model"
+    meta_model_available = os.path.exists(f"{MODEL_PATH}.pkl") and os.path.exists(f"{MODEL_PATH}_scaler.pkl")
+    if meta_model_available:
+        use_meta_filter = st.checkbox("Apply meta-model filter to signals", value=False)
+        meta_threshold = st.slider("Meta-model probability threshold", 0.0, 1.0, 0.55, 0.05)
+    else:
+        use_meta_filter = False
+        meta_threshold = 0.55
+        st.caption(
+            "No trained meta-model found. Run `python train_meta_model.py` "
+            "from the project root to enable this filter."
+        )
+
     run_button = st.button("Run Pipeline", type="primary")
+
+# Load the meta-model once per script run (not per pair) if the filter is on.
+meta_model, meta_scaler = None, None
+if use_meta_filter and meta_model_available:
+    try:
+        meta_model, meta_scaler = load_model(MODEL_PATH)
+    except Exception as e:
+        st.sidebar.warning(f"Could not load meta-model: {e}")
+        use_meta_filter = False
 
 if run_button:
     with st.spinner("Downloading price data..."):
         prices = download_universe(
-            NIFTY50_TICKERS,
+            BFSI_TICKERS,
             start=str(start_date),
             end=str(end_date),
             force_refresh=force_refresh,
         )
 
     n_returned = prices.shape[1]
-    n_requested = len(NIFTY50_TICKERS)
+    n_requested = len(BFSI_TICKERS)
     n_failed = n_requested - n_returned
     if n_failed > 0:
         st.warning(
@@ -127,7 +154,11 @@ if "prices" in st.session_state:
         ax.set_ylabel("PC2")
         st.pyplot(fig)
 
-        st.write(f"Suggested eps (heuristic): **{suggest_eps(clustered[['PC1', 'PC2']]):.3f}**")
+        pc_cols = [c for c in clustered.columns if c.startswith("PC")]
+        st.write(
+            f"Suggested eps (heuristic): "
+            f"**{suggest_eps(clustered[pc_cols], min_samples=min_samples):.3f}**"
+        )
         st.dataframe(clustered)
 
     with tab2:
@@ -182,9 +213,36 @@ if "prices" in st.session_state:
             t1, t2 = res["pair"]
 
             y, x = prices[t1], prices[t2]
-            spread = compute_spread(y, x, res["hedge_ratio"], res.get("intercept", 0.0))
+            # direction comes from cointegration.py's bidirectional Engle-Granger
+            # test -- required now, since which of t1/t2 was actually the
+            # regressed-on-variable can flip per pair. Defaults to the old
+            # fixed "y_on_x" behavior if a result predates this field.
+            reg_direction = res.get("direction", "y_on_x")
+            spread = compute_spread(
+                y, x, res["hedge_ratio"], res.get("intercept", 0.0),
+                direction=reg_direction,
+            )
             z = compute_zscore(spread, window=zscore_window)
             sig = generate_signals(z, entry_threshold, exit_threshold, stop_loss)
+
+            if use_meta_filter and meta_model is not None:
+                sig_for_backtest, trade_log = apply_meta_filter_to_signals(
+                    sig, z, res["pair"], res["hedge_ratio"],
+                    res.get("eg_pvalue", res.get("adf_pvalue")), reg_direction,
+                    meta_model, meta_scaler, threshold=meta_threshold,
+                )
+                if not trade_log.empty:
+                    n_total = len(trade_log)
+                    n_kept = int(trade_log["meta_take_trade"].sum())
+                    st.caption(
+                        f"Meta-model filter: kept **{n_kept}/{n_total}** "
+                        f"historical entries at threshold {meta_threshold:.2f}."
+                    )
+                else:
+                    st.caption("Meta-model filter: not enough history before the "
+                               "first entry to score it — showing unfiltered signals.")
+            else:
+                sig_for_backtest = sig
 
             fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
             axes[0].plot(y, label=t1)
@@ -203,8 +261,14 @@ if "prices" in st.session_state:
 
             st.pyplot(fig)
 
-            result, metrics = backtest_pair(y, x, res["hedge_ratio"], sig)
-            st.write("**Performance metrics**")
+            result, metrics = backtest_pair(
+                y, x, res["hedge_ratio"], sig_for_backtest,
+                direction=reg_direction,
+            )
+            metrics_label = "**Performance metrics**" + (
+                " (meta-filtered)" if use_meta_filter and meta_model is not None else ""
+            )
+            st.write(metrics_label)
             st.json(metrics)
             st.line_chart(result["equity_curve"])
         else:
@@ -213,14 +277,29 @@ if "prices" in st.session_state:
     with tab4:
         st.subheader("Backtest Summary Across All Pairs")
         if pair_results:
-            summary = backtest_multiple_pairs(
-                prices,
-                pair_results,
-                zscore_window=zscore_window,
-                entry_threshold=entry_threshold,
-                exit_threshold=exit_threshold,
-                stop_loss=stop_loss,
-            )
+            if use_meta_filter and meta_model is not None:
+                summary = backtest_multiple_pairs_with_meta_filter(
+                    prices,
+                    pair_results,
+                    meta_model,
+                    meta_scaler,
+                    zscore_window=zscore_window,
+                    entry_threshold=entry_threshold,
+                    exit_threshold=exit_threshold,
+                    stop_loss=stop_loss,
+                    meta_threshold=meta_threshold,
+                )
+                st.caption(f"Meta-model filter active (threshold {meta_threshold:.2f}).")
+            else:
+                summary = backtest_multiple_pairs(
+                    prices,
+                    pair_results,
+                    zscore_window=zscore_window,
+                    entry_threshold=entry_threshold,
+                    exit_threshold=exit_threshold,
+                    stop_loss=stop_loss,
+                )
+
             if not summary.empty:
                 best_idx = summary["sharpe_ratio"].idxmax()
                 best = summary.loc[best_idx]

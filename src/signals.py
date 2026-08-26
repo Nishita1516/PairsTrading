@@ -9,9 +9,26 @@ import pandas as pd
 import numpy as np
 
 
-def compute_spread(y: pd.Series, x: pd.Series, hedge_ratio: float, intercept: float = 0.0) -> pd.Series:
-    """Spread = y - hedge_ratio * x - intercept."""
-    return y - hedge_ratio * x - intercept
+def compute_spread(y: pd.Series, x: pd.Series, hedge_ratio: float,
+                    intercept: float = 0.0, direction: str = "y_on_x") -> pd.Series:
+    """
+    Spread = y - hedge_ratio * x - intercept  (direction="y_on_x", default)
+          or x - hedge_ratio * y - intercept  (direction="x_on_y")
+
+    `direction` matches cointegration.py's bidirectional Engle-Granger
+    test — it tests both "y regressed on x" and "x regressed on y" and
+    keeps whichever is stronger, so which series was actually the
+    dependent variable can flip per pair. Pass `res["direction"]`
+    straight through from the pair's cointegration result; the default
+    ("y_on_x") preserves the old single-direction behavior for any
+    caller that doesn't pass one.
+    """
+    if direction == "y_on_x":
+        return y - hedge_ratio * x - intercept
+    elif direction == "x_on_y":
+        return x - hedge_ratio * y - intercept
+    else:
+        raise ValueError(f"Unknown direction: {direction!r} (expected 'y_on_x' or 'x_on_y')")
 
 
 def compute_zscore(spread: pd.Series, window: int = 30) -> pd.Series:

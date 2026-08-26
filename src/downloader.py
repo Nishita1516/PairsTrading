@@ -5,9 +5,9 @@ Downloads historical OHLCV data for a universe of stocks using yfinance
 and caches it locally as CSV/Parquet so repeated runs don't re-hit the API.
 
 Usage:
-    from src.downloader import download_universe, NIFTY50_TICKERS
+    from src.downloader import download_universe, BFSI_TICKERS
 
-    prices = download_universe(NIFTY50_TICKERS, start="2021-01-01", end="2026-01-01")
+    prices = download_universe(BFSI_TICKERS, start="2021-01-01", end="2026-01-01")
 """
 
 import os
@@ -15,10 +15,19 @@ import time
 import pandas as pd
 import yfinance as yf
 
-from src.config import NIFTY_50_TICKERS
+from src.bfsi_universe import get_bfsi_universe
 
-# Backward-compatible name used by app.py and the README examples.
-NIFTY50_TICKERS = NIFTY_50_TICKERS
+# Sector universe: Banking & Financial Services (incl. NBFCs) — replaces
+# the former NIFTY 50 universe. 61 tickers across 7 sub-segments; see
+# src/bfsi_universe.py for the breakdown and validate_universe() to drop
+# any symbol yfinance can't return enough history for.
+BFSI_TICKERS = get_bfsi_universe()
+
+# Backward-compatible alias — update app.py / notebooks to import
+# BFSI_TICKERS directly, then remove this line. Kept for now so existing
+# call sites (e.g. `from src.downloader import NIFTY50_TICKERS`) don't
+# break immediately.
+NIFTY50_TICKERS = BFSI_TICKERS
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 
@@ -39,7 +48,7 @@ def download_universe(
     Parameters
     ----------
     tickers : list[str] or None
-        Defaults to NIFTY50_TICKERS.
+        Defaults to BFSI_TICKERS.
     start, end : str
         Date range (YYYY-MM-DD). end=None means "today".
     field : str
@@ -56,7 +65,7 @@ def download_universe(
     -------
     pd.DataFrame
     """
-    tickers = tickers or NIFTY50_TICKERS
+    tickers = tickers or BFSI_TICKERS
 
     # --- Bug #1 fix: key cache on date range so slider changes take effect ---
     if cache_path is None:
